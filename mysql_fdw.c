@@ -721,7 +721,20 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 	/* Prepare MySQL statement */
 	if (mysql_stmt_prepare(festate->stmt, festate->query,
 						   strlen(festate->query)) != 0)
-		mysql_stmt_error_print(festate, "failed to prepare the MySQL query");
+	{
+		elog(DEBUG1,
+			 "mysql_fdw: mysql_stmt_prepare() failed for SELECT (%s); "
+			 "falling back to text protocol",
+			 mysql_error(festate->conn));
+		mysql_stmt_close(festate->stmt);
+		festate->stmt = NULL;
+		festate->use_text_protocol = true;
+		festate->text_result = NULL;
+		/* Skip all stmt-based setup */
+		numParams = list_length(fsplan->fdw_exprs);
+		festate->numParams = numParams;
+		return;
+	}
 
 	/* Prepare for output conversion of parameters used in remote query. */
 	numParams = list_length(fsplan->fdw_exprs);
@@ -1590,8 +1603,12 @@ mysqlGetForeignPlan(PlannerInfo *root, RelOptInfo *foreignrel,
 		(root->parse->commandType == CMD_UPDATE ||
 		 root->parse->commandType == CMD_DELETE))
 	{
-		/* Relation is UPDATE/DELETE target, so use FOR UPDATE */
-		appendStringInfoString(&sql, " FOR UPDATE");
+		/*
+		 * Relation is UPDATE/DELETE target.  Normally we would append
+		 * " FOR UPDATE" here to lock the row on the remote side, but Doris
+		 * (and some other MySQL-protocol-compatible engines) do not support
+		 * that syntax.  Skip it; row-level locking is handled by PostgreSQL.
+		 */
 	}
 
 	/*
