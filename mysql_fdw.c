@@ -114,6 +114,7 @@ unsigned int ((mysql_stmt_errno) (MYSQL_STMT *stmt));
 unsigned int ((mysql_errno) (MYSQL *mysql));
 unsigned int ((mysql_num_fields) (MYSQL_RES *result));
 unsigned int ((mysql_num_rows) (MYSQL_RES *result));
+unsigned long *((mysql_fetch_lengths) (MYSQL_RES *result));
 
 #define DEFAULTE_NUM_ROWS    1000
 
@@ -432,6 +433,7 @@ mysql_load_library(void)
 	_mysql_get_host_info = dlsym(mysql_dll_handle, "mysql_get_host_info");
 	_mysql_get_server_info = dlsym(mysql_dll_handle, "mysql_get_server_info");
 	_mysql_get_proto_info = dlsym(mysql_dll_handle, "mysql_get_proto_info");
+	_mysql_fetch_lengths = dlsym(mysql_dll_handle, "mysql_fetch_lengths");
 
 	if (_mysql_stmt_bind_param == NULL ||
 		_mysql_stmt_bind_result == NULL ||
@@ -462,7 +464,8 @@ mysql_load_library(void)
 		_mysql_num_rows == NULL ||
 		_mysql_get_host_info == NULL ||
 		_mysql_get_server_info == NULL ||
-		_mysql_get_proto_info == NULL)
+		_mysql_get_proto_info == NULL ||
+		_mysql_fetch_lengths == NULL)
 		return false;
 
 	return true;
@@ -680,6 +683,8 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 	festate->conn = conn;
 	festate->query_executed = false;
 	festate->has_var_size_col = false;
+	festate->use_text_protocol = false;
+	festate->text_result = NULL;
 	festate->attinmeta = TupleDescGetAttInMetadata(tupleDescriptor);
 
 	festate->temp_cxt = AllocSetContextCreate(estate->es_query_cxt,
@@ -745,10 +750,29 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 
 	festate->table->mysql_res = mysql_stmt_result_metadata(festate->stmt);
 	if (NULL == festate->table->mysql_res)
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				 errmsg("failed to retrieve query result set metadata: \n%s",
-						mysql_error(festate->conn))));
+	{
+		/*
+		 * The remote server does not support the prepared-statement binary
+		 * protocol (e.g. Apache Doris).  Fall back to the text protocol:
+		 * we will execute the query with mysql_query() and fetch rows with
+		 * mysql_fetch_row() instead of the stmt API.
+		 */
+		elog(DEBUG1,
+			 "mysql_fdw: mysql_stmt_result_metadata() returned NULL (%s); "
+			 "falling back to text protocol",
+			 mysql_error(festate->conn));
+
+		mysql_stmt_close(festate->stmt);
+		festate->stmt = NULL;
+		festate->use_text_protocol = true;
+		festate->text_result = NULL;
+
+		/* Skip the stmt-based bind/attr setup below */
+		return;
+	}
+
+	festate->use_text_protocol = false;
+	festate->text_result = NULL;
 
 	festate->table->mysql_fields = mysql_fetch_fields(festate->table->mysql_res);
 
@@ -823,6 +847,69 @@ mysqlIterateForeignScan(ForeignScanState *node)
 	if (!festate->query_executed)
 		bind_stmt_params_and_exec(node);
 
+	/* ----------------------------------------------------------------
+	 * Text protocol path (fallback for servers like Apache Doris that
+	 * do not support the MySQL binary prepared-statement protocol).
+	 * ---------------------------------------------------------------- */
+	if (festate->use_text_protocol)
+	{
+		MYSQL_ROW	row;
+		unsigned long *lengths;
+		MYSQL_FIELD *fields;
+		unsigned int num_fields;
+
+		row = mysql_fetch_row(festate->text_result);
+		if (row == NULL)
+			return tupleSlot;	/* no more rows */
+
+		lengths = mysql_fetch_lengths(festate->text_result);
+		fields = mysql_fetch_fields(festate->text_result);
+		num_fields = mysql_num_fields(festate->text_result);
+
+		attid = 0;
+		foreach(lc, festate->retrieved_attrs)
+		{
+			int			attnum = lfirst_int(lc) - 1;
+			Oid			pgtype = TupleDescAttr(attinmeta->tupdesc, attnum)->atttypid;
+			int32		pgtypmod = TupleDescAttr(attinmeta->tupdesc, attnum)->atttypmod;
+
+			if (attid >= (int) num_fields)
+				break;
+
+			if (row[attid] == NULL)
+			{
+				nulls[attnum] = true;
+			}
+			else
+			{
+				mysql_column	col;
+				MYSQL_BIND		dummy_bind;
+
+				memset(&dummy_bind, 0, sizeof(dummy_bind));
+				col.mysql_bind = &dummy_bind;
+				col.is_null = false;
+				col.error = false;
+				col.length = lengths[attid];
+				col.value = (Datum) row[attid];
+
+				nulls[attnum] = false;
+				dvalues[attnum] = mysql_convert_to_pg(pgtype, pgtypmod, &col);
+			}
+			attid++;
+		}
+
+		tup = heap_form_tuple(attinmeta->tupdesc, dvalues, nulls);
+		if (tup)
+			ExecStoreHeapTuple(tup, tupleSlot, false);
+
+		pfree(dvalues);
+		pfree(nulls);
+		return tupleSlot;
+	}
+
+	/* ----------------------------------------------------------------
+	 * Binary prepared-statement protocol path (normal MySQL / MariaDB).
+	 * ---------------------------------------------------------------- */
 	attid = 0;
 	rc = mysql_stmt_fetch(festate->stmt);
 	if (rc == 0)
@@ -840,7 +927,6 @@ mysqlIterateForeignScan(ForeignScanState *node)
 
 			attid++;
 		}
-
 		ExecClearTuple(tupleSlot);
 
 		if (list_length(fdw_private) >= mysqlFdwPrivateScanTList)
@@ -960,6 +1046,17 @@ mysqlEndForeignScan(ForeignScanState *node)
 {
 	MySQLFdwExecState *festate = (MySQLFdwExecState *) node->fdw_state;
 
+	/* Text protocol: free the stored result set */
+	if (festate->use_text_protocol)
+	{
+		if (festate->text_result)
+		{
+			mysql_free_result(festate->text_result);
+			festate->text_result = NULL;
+		}
+		return;
+	}
+
 	if (festate->table && festate->table->mysql_res)
 	{
 		mysql_free_result(festate->table->mysql_res);
@@ -988,6 +1085,12 @@ mysqlReScanForeignScan(ForeignScanState *node)
 	 */
 	festate->query_executed = false;
 
+	/* Text protocol: release the previous result set so we re-execute */
+	if (festate->use_text_protocol && festate->text_result)
+	{
+		mysql_free_result(festate->text_result);
+		festate->text_result = NULL;
+	}
 }
 
 /*
@@ -2591,6 +2694,38 @@ bind_stmt_params_and_exec(ForeignScanState *node)
 	TupleDesc	tupleDescriptor = festate->attinmeta->tupdesc;
 	int			atindex = 0;
 	MemoryContext oldcontext;
+
+	/* ----------------------------------------------------------------
+	 * Text protocol fallback path.
+	 * ---------------------------------------------------------------- */
+	if (festate->use_text_protocol)
+	{
+		/*
+		 * Parameters in the text protocol path are not supported via
+		 * prepared statements.  For now we only handle the no-parameter
+		 * case (which covers the common SELECT * / table-browse scenario).
+		 * Parameterised queries will still fail gracefully.
+		 */
+		if (mysql_query(festate->conn, festate->query) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+					 errmsg("failed to execute the MySQL query (text protocol): %s",
+							mysql_error(festate->conn))));
+
+		festate->text_result = mysql_store_result(festate->conn);
+		if (festate->text_result == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+					 errmsg("failed to store the MySQL result (text protocol): %s",
+							mysql_error(festate->conn))));
+
+		festate->query_executed = true;
+		return;
+	}
+
+	/* ----------------------------------------------------------------
+	 * Binary prepared-statement protocol path.
+	 * ---------------------------------------------------------------- */
 
 	/*
 	 * Construct array of query parameter values in text format.  We do the
