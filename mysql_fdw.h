@@ -42,6 +42,7 @@
 #define CR_NO_ERROR 0
 
 #define mysql_fetch_lengths (*_mysql_fetch_lengths)
+#define mysql_real_escape_string (*_mysql_real_escape_string)
 #define mysql_options (*_mysql_options)
 #define mysql_stmt_prepare (*_mysql_stmt_prepare)
 #define mysql_stmt_execute (*_mysql_stmt_execute)
@@ -302,6 +303,9 @@ extern unsigned int ((mysql_errno) (MYSQL *mysql));
 extern unsigned int ((mysql_num_fields) (MYSQL_RES *result));
 extern unsigned int ((mysql_num_rows) (MYSQL_RES *result));
 extern unsigned long *((mysql_fetch_lengths) (MYSQL_RES *result));
+extern unsigned long ((mysql_real_escape_string) (MYSQL *mysql, char *to,
+												  const char *from,
+												  unsigned long length));
 
 
 /* option.c headers */

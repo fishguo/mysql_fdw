@@ -115,6 +115,9 @@ unsigned int ((mysql_errno) (MYSQL *mysql));
 unsigned int ((mysql_num_fields) (MYSQL_RES *result));
 unsigned int ((mysql_num_rows) (MYSQL_RES *result));
 unsigned long *((mysql_fetch_lengths) (MYSQL_RES *result));
+unsigned long ((mysql_real_escape_string) (MYSQL *mysql, char *to,
+										   const char *from,
+										   unsigned long length));
 
 #define DEFAULTE_NUM_ROWS    1000
 
@@ -358,6 +361,8 @@ static int interactive_timeout = INTERACTIVE_TIMEOUT;
 static void mysql_error_print(MYSQL *conn);
 static void mysql_stmt_error_print(MySQLFdwExecState *festate,
 								   const char *msg);
+static char *mysql_build_text_query(MYSQL *conn, const char *tmpl,
+									MYSQL_BIND *binds, int nbinds);
 static List *getUpdateTargetAttrs(PlannerInfo *root, RangeTblEntry *rte);
 #if PG_VERSION_NUM >= 140000
 static char *mysql_remove_quotes(char *s1);
@@ -434,6 +439,7 @@ mysql_load_library(void)
 	_mysql_get_server_info = dlsym(mysql_dll_handle, "mysql_get_server_info");
 	_mysql_get_proto_info = dlsym(mysql_dll_handle, "mysql_get_proto_info");
 	_mysql_fetch_lengths = dlsym(mysql_dll_handle, "mysql_fetch_lengths");
+	_mysql_real_escape_string = dlsym(mysql_dll_handle, "mysql_real_escape_string");
 
 	if (_mysql_stmt_bind_param == NULL ||
 		_mysql_stmt_bind_result == NULL ||
@@ -465,7 +471,8 @@ mysql_load_library(void)
 		_mysql_get_host_info == NULL ||
 		_mysql_get_server_info == NULL ||
 		_mysql_get_proto_info == NULL ||
-		_mysql_fetch_lengths == NULL)
+		_mysql_fetch_lengths == NULL ||
+		_mysql_real_escape_string == NULL)
 		return false;
 
 	return true;
@@ -2004,22 +2011,30 @@ mysqlExecForeignInsert(EState *estate,
 	if (mysql_query(fmstate->conn, sql_mode) != 0)
 		mysql_error_print(fmstate->conn);
 
-	foreach(lc, fmstate->retrieved_attrs)
 	{
-		int			attnum = lfirst_int(lc) - 1;
-		Oid			type = TupleDescAttr(slot->tts_tupleDescriptor, attnum)->atttypid;
-		Datum		value;
+		int bindidx = 0;
 
-		value = slot_getattr(slot, attnum + 1, &isnull[attnum]);
+		foreach(lc, fmstate->retrieved_attrs)
+		{
+			int			attnum = lfirst_int(lc) - 1;
+			Oid			type = TupleDescAttr(slot->tts_tupleDescriptor, attnum)->atttypid;
+			Datum		value;
 
-		mysql_bind_sql_var(type, attnum, value, mysql_bind_buffer,
-						   &isnull[attnum]);
+			value = slot_getattr(slot, attnum + 1, &isnull[bindidx]);
+
+			mysql_bind_sql_var(type, bindidx, value, mysql_bind_buffer,
+							   &isnull[bindidx]);
+			bindidx++;
+		}
 	}
 
 	if (fmstate->use_text_protocol)
 	{
-		/* Text protocol: execute the parameterised INSERT as a plain query */
-		if (mysql_query(fmstate->conn, fmstate->query) != 0)
+		/* Build a complete SQL with values inlined (no ? placeholders) */
+		char *full_sql = mysql_build_text_query(fmstate->conn, fmstate->query,
+												mysql_bind_buffer, n_params);
+
+		if (mysql_query(fmstate->conn, full_sql) != 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
 					 errmsg("failed to execute the MySQL INSERT (text protocol): %s",
@@ -2163,7 +2178,10 @@ mysqlExecForeignUpdate(EState *estate,
 
 	if (fmstate->use_text_protocol)
 	{
-		if (mysql_query(fmstate->conn, fmstate->query) != 0)
+		char *full_sql = mysql_build_text_query(fmstate->conn, fmstate->query,
+												mysql_bind_buffer, bindnum + 1);
+
+		if (mysql_query(fmstate->conn, full_sql) != 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
 					 errmsg("failed to execute the MySQL UPDATE (text protocol): %s",
@@ -2274,7 +2292,10 @@ mysqlExecForeignDelete(EState *estate,
 
 	if (fmstate->use_text_protocol)
 	{
-		if (mysql_query(fmstate->conn, fmstate->query) != 0)
+		char *full_sql = mysql_build_text_query(fmstate->conn, fmstate->query,
+												mysql_bind_buffer, 1);
+
+		if (mysql_query(fmstate->conn, full_sql) != 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
 					 errmsg("failed to execute the MySQL DELETE (text protocol): %s",
@@ -2863,6 +2884,95 @@ Datum
 mysql_fdw_version(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT32(CODE_VERSION);
+}
+
+/*
+ * mysql_build_text_query:
+ *		Replace each '?' placeholder in the template query with the
+ *		corresponding value from the MYSQL_BIND array, producing a complete
+ *		SQL string suitable for mysql_query() (text protocol).
+ *
+ *		Only the buffer_type / buffer / buffer_length / is_null fields of each
+ *		MYSQL_BIND entry are consulted; the result is palloc'd.
+ */
+static char *
+mysql_build_text_query(MYSQL *conn, const char *tmpl, MYSQL_BIND *binds,
+					   int nbinds)
+{
+	StringInfoData buf;
+	const char *p = tmpl;
+	int			bindidx = 0;
+
+	initStringInfo(&buf);
+
+	while (*p)
+	{
+		if (*p == '?' && bindidx < nbinds)
+		{
+			MYSQL_BIND *b = &binds[bindidx++];
+
+#if MYSQL_VERSION_ID < 80000 || MARIADB_VERSION_ID >= 100000
+			if (b->is_null && *(my_bool *) b->is_null)
+#else
+			if (b->is_null && *b->is_null)
+#endif
+			{
+				appendStringInfoString(&buf, "NULL");
+			}
+			else
+			{
+				switch (b->buffer_type)
+				{
+					case MYSQL_TYPE_SHORT:
+						appendStringInfo(&buf, "%d", *(int16 *) b->buffer);
+						break;
+					case MYSQL_TYPE_LONG:
+						appendStringInfo(&buf, "%d", *(int32 *) b->buffer);
+						break;
+					case MYSQL_TYPE_LONGLONG:
+						appendStringInfo(&buf, INT64_FORMAT,
+										 *(int64 *) b->buffer);
+						break;
+					case MYSQL_TYPE_FLOAT:
+						appendStringInfo(&buf, "%g", (double) *(float4 *) b->buffer);
+						break;
+					case MYSQL_TYPE_DOUBLE:
+						appendStringInfo(&buf, "%g", *(float8 *) b->buffer);
+						break;
+					case MYSQL_TYPE_DATE:
+					case MYSQL_TYPE_TIMESTAMP:
+						{
+							MYSQL_TIME *ts = (MYSQL_TIME *) b->buffer;
+
+							appendStringInfo(&buf,
+											 "'%04d-%02d-%02d %02d:%02d:%02d'",
+											 ts->year, ts->month, ts->day,
+											 ts->hour, ts->minute, ts->second);
+						}
+						break;
+					default:
+						{
+							/* String / blob: escape and quote */
+							unsigned long slen = b->buffer_length;
+							char	   *escaped = palloc(slen * 2 + 1);
+
+							mysql_real_escape_string(conn, escaped,
+													 (char *) b->buffer, slen);
+							appendStringInfo(&buf, "'%s'", escaped);
+							pfree(escaped);
+						}
+						break;
+				}
+			}
+			p++;
+		}
+		else
+		{
+			appendStringInfoChar(&buf, *p++);
+		}
+	}
+
+	return buf.data;
 }
 
 static void
