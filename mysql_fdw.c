@@ -1724,9 +1724,10 @@ mysqlPlanForeignModify(PlannerInfo *root,
 	foreignTableId = RelationGetRelid(rel);
 
 	if (!mysql_is_column_unique(foreignTableId))
-		ereport(ERROR,
+		ereport(WARNING,
 				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				 errmsg("first column of remote table must be unique for INSERT/UPDATE/DELETE operation")));
+				 errmsg("first column of remote table must be unique for INSERT/UPDATE/DELETE operation"),
+				 errhint("Continuing anyway; data consistency is not guaranteed if the column is not unique.")));
 
 	/*
 	 * ON CONFLICT DO UPDATE and DO NOTHING case with inference specification
@@ -1926,7 +1927,7 @@ mysqlBeginForeignModify(ModifyTableState *mtstate,
 
 	n_params = list_length(fmstate->retrieved_attrs);
 
-	/* Initialize mysql statment */
+	/* Initialize mysql statement */
 	fmstate->stmt = mysql_stmt_init(fmstate->conn);
 	if (!fmstate->stmt)
 		ereport(ERROR,
@@ -1934,10 +1935,20 @@ mysqlBeginForeignModify(ModifyTableState *mtstate,
 				 errmsg("failed to initialize the MySQL query: \n%s",
 						mysql_error(fmstate->conn))));
 
-	/* Prepare mysql statment */
+	/* Prepare mysql statement; fall back to text protocol if it fails */
 	if (mysql_stmt_prepare(fmstate->stmt, fmstate->query,
 						   strlen(fmstate->query)) != 0)
-		mysql_stmt_error_print(fmstate, "failed to prepare the MySQL query");
+	{
+		elog(DEBUG1,
+			 "mysql_fdw: mysql_stmt_prepare() failed for DML (%s); "
+			 "falling back to text protocol",
+			 mysql_error(fmstate->conn));
+		mysql_stmt_close(fmstate->stmt);
+		fmstate->stmt = NULL;
+		fmstate->use_text_protocol = true;
+	}
+	else
+		fmstate->use_text_protocol = false;
 
 	resultRelInfo->ri_FdwState = fmstate;
 }
@@ -1988,13 +1999,24 @@ mysqlExecForeignInsert(EState *estate,
 						   &isnull[attnum]);
 	}
 
-	/* Bind values */
-	if (mysql_stmt_bind_param(fmstate->stmt, mysql_bind_buffer) != 0)
-		mysql_stmt_error_print(fmstate, "failed to bind the MySQL query");
+	if (fmstate->use_text_protocol)
+	{
+		/* Text protocol: execute the parameterised INSERT as a plain query */
+		if (mysql_query(fmstate->conn, fmstate->query) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+					 errmsg("failed to execute the MySQL INSERT (text protocol): %s",
+							mysql_error(fmstate->conn))));
+	}
+	else
+	{
+		/* Binary prepared-statement protocol */
+		if (mysql_stmt_bind_param(fmstate->stmt, mysql_bind_buffer) != 0)
+			mysql_stmt_error_print(fmstate, "failed to bind the MySQL query");
 
-	/* Execute the query */
-	if (mysql_stmt_execute(fmstate->stmt) != 0)
-		mysql_stmt_error_print(fmstate, "failed to execute the MySQL query");
+		if (mysql_stmt_execute(fmstate->stmt) != 0)
+			mysql_stmt_error_print(fmstate, "failed to execute the MySQL query");
+	}
 
 	MemoryContextSwitchTo(oldcontext);
 	MemoryContextReset(fmstate->temp_cxt);
@@ -2122,15 +2144,25 @@ mysqlExecForeignUpdate(EState *estate,
 	/* Bind qual */
 	mysql_bind_sql_var(typeoid, bindnum, value, mysql_bind_buffer, &is_null);
 
-	if (mysql_stmt_bind_param(fmstate->stmt, mysql_bind_buffer) != 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				 errmsg("failed to bind the MySQL query: %s",
-						mysql_error(fmstate->conn))));
+	if (fmstate->use_text_protocol)
+	{
+		if (mysql_query(fmstate->conn, fmstate->query) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+					 errmsg("failed to execute the MySQL UPDATE (text protocol): %s",
+							mysql_error(fmstate->conn))));
+	}
+	else
+	{
+		if (mysql_stmt_bind_param(fmstate->stmt, mysql_bind_buffer) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+					 errmsg("failed to bind the MySQL query: %s",
+							mysql_error(fmstate->conn))));
 
-	/* Execute the query */
-	if (mysql_stmt_execute(fmstate->stmt) != 0)
-		mysql_stmt_error_print(fmstate, "failed to execute the MySQL query");
+		if (mysql_stmt_execute(fmstate->stmt) != 0)
+			mysql_stmt_error_print(fmstate, "failed to execute the MySQL query");
+	}
 
 	/* Return NULL if nothing was updated on the remote end */
 	return slot;
@@ -2223,15 +2255,25 @@ mysqlExecForeignDelete(EState *estate,
 	/* Bind qual */
 	mysql_bind_sql_var(typeoid, 0, value, mysql_bind_buffer, &is_null);
 
-	if (mysql_stmt_bind_param(fmstate->stmt, mysql_bind_buffer) != 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				 errmsg("failed to execute the MySQL query: %s",
-						mysql_error(fmstate->conn))));
+	if (fmstate->use_text_protocol)
+	{
+		if (mysql_query(fmstate->conn, fmstate->query) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+					 errmsg("failed to execute the MySQL DELETE (text protocol): %s",
+							mysql_error(fmstate->conn))));
+	}
+	else
+	{
+		if (mysql_stmt_bind_param(fmstate->stmt, mysql_bind_buffer) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+					 errmsg("failed to execute the MySQL query: %s",
+							mysql_error(fmstate->conn))));
 
-	/* Execute the query */
-	if (mysql_stmt_execute(fmstate->stmt) != 0)
-		mysql_stmt_error_print(fmstate, "failed to execute the MySQL query");
+		if (mysql_stmt_execute(fmstate->stmt) != 0)
+			mysql_stmt_error_print(fmstate, "failed to execute the MySQL query");
+	}
 
 	/* Return NULL if nothing was updated on the remote end */
 	return slot;
